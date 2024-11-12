@@ -14,7 +14,7 @@ class OpenAIService:
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {
                         "role": "user",
-                        "content": f"Generate a get well soon message for {username} based on their message: {message}",
+                        "content": f"Write a get well soon message reply for {username}. He/She texted in the office group that {message}",
                     },
                 ],
             )
