@@ -1,89 +1,76 @@
-from slack_bolt import App
+from fastapi import FastAPI, Request
 from slack_bolt.adapter.fastapi import SlackRequestHandler
-from openai import OpenAI
-import os
+from services.openai_service import OpenAIService
+from services.slack_service import SlackService
+from config import logger
 
-OAIclient = OpenAI()
-
-# Initialize your app with your bot token and signing secret
-app = App(
-    token=os.environ.get("SLACK_BOT_TOKEN"),
-    signing_secret=os.environ.get("SLACK_SIGNING_SECRET"),
-)
-
-app_handler = SlackRequestHandler(app)
-
-allowed_channel_names = ["leave-afk", "test-2"]
+# Initialize services
+slack_service = SlackService()
+openai_service = OpenAIService()
+app_handler = SlackRequestHandler(slack_service.app)
 
 
-# Define a listener for mentions
-@app.event("app_mention")
+@slack_service.app.event("app_mention")
 def respond_to_mention(body, say, client):
-    print("Got mention!")
-    print("Received mention event:", body)
-    channel_id = body["event"]["channel"]
-    thread_author_id = body["event"]["parent_user_id"]
-    thread_id = body["event"]["thread_ts"]
+    logger.debug("Received app mention event")
 
-    # Get the user who was mentioned in the message
-    user_mentioned = body["event"]["text"].split("<@")[1].split(">")[0]
-    print("User mentioned ID:", user_mentioned)
+    try:
+        # Get channel info
+        channel_id = body["event"]["channel"]
+        channel_info = slack_service.get_channel_info(client, channel_id)
+        channel_name = channel_info["name"]
 
-    channel_info = client.conversations_info(channel=channel_id)
-    # Extract the channel name from the response
-    channel_name = channel_info["channel"]["name"]
-    print(channel_name)
+        # Check if channel is allowed
+        if not slack_service.is_channel_allowed(channel_name):
+            logger.warning(
+                f"Mention received in unauthorized channel: {channel_name}")
+            say(
+                text="Sorry, I can only respond in specific channels!",
+                thread_ts=body["event"]["ts"],
+            )
+            return
 
-    # Check if the mentioned user is your bot
-    if (
-        user_mentioned == os.environ.get("SLACK_BOT_USER_ID")
-        and channel_name in allowed_channel_names
-    ):
-        thread_replies = client.conversations_replies(channel=channel_id, ts=thread_id)
-        thread_original_message = thread_replies["messages"][0]["text"]
+        # Get thread info
+        thread_ts = body["event"].get("thread_ts", body["event"]["ts"])
+        thread_messages = slack_service.get_thread_messages(
+            client, channel_id, thread_ts)
 
-        # Get the username of the original author
-        original_author_info = client.users_info(user=thread_author_id)
-        original_author_user_name = original_author_info["user"]["profile"][
-            "display_name"
-        ]
+        # Get original message author
+        original_message = thread_messages["messages"][0]
+        thread_author_id = original_message["user"]
+        user_info = slack_service.get_user_info(client, thread_author_id)
+        user_id = user_info["id"]
 
-        # GPT Magic
-        completion = OAIclient.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {
-                    "role": "system",
-                    "content": f'You are working in a IT company. You are sympathetic and caring about your coworkers well being. Your name is Naveen. Also suggest some home remedies. make it concise. in the greeting, after Dear, use "<@{thread_author_id}>" also if you think that the person is female, use honorifics, titles, or respectful salutations like Your Excellency, Your Highness, Queen, Honorable, Esteemed or something similar. also in the end add a relatable, sassy and funny motivation quote.',
-                },
-                {
-                    "role": "user",
-                    "content": f"Write a get well soon message reply for {original_author_user_name}. He/She texted in the office group that {thread_original_message}",
-                },
-            ],
+        # Generate response using OpenAI
+        message_text = original_message["text"]
+        response = openai_service.generate_response(
+            user_id,
+            message_text
         )
 
-        print(completion.choices[0].message.content)
-        res_msg = completion.choices[0].message.content
+        # Post the message in thread
+        say(text=response, thread_ts=body["event"]["ts"], channel=channel_id)
+        logger.debug("Response sent successfully")
 
-        # Get well soon message
-        # message = f"Hey <@{thread_author_id}>, get well soon! NAME -> {original_author_user_name} 🌟"
-        message = res_msg
+    except Exception as e:
+        logger.error(f"Error processing mention: {str(e)}")
+        say(
+            text="Sorry, I encountered an error processing your request.",
+            thread_ts=body["event"]["ts"],
+        )
 
-        # Post the message in a thread
-        say(text=message, thread_ts=body["event"]["ts"], channel=channel_id)
 
-
-from fastapi import FastAPI, Request
-
+# FastAPI app
 api = FastAPI()
 
 
 @api.post("/slack/events")
 async def endpoint(req: Request):
+    logger.debug("Received request to /slack/events endpoint")
     return await app_handler.handle(req)
 
 
 @api.get("/health")
 async def health(req: Request):
-    return f"OK! {req.headers}"
+    logger.debug("Health check requested")
+    return {"status": "OK", "headers": dict(req.headers)}
